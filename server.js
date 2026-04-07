@@ -1,3 +1,8 @@
+// ============================================================
+// Birmingham Glass Solutions Ltd — Zoho Cliq Bot Webhook
+// Stack: Node.js + Express + OpenRouter (via OpenAI SDK) + Zoho MCP
+// ============================================================
+
 import express from 'express';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -8,66 +13,122 @@ dotenv.config();
 
 const app = express();
 app.use(express.json());
+app.use(express.text()); // Fallback for non-JSON Cliq payloads
 
-// Catch Bad JSON (Multi-line) so the server doesn't crash
+// Catch malformed JSON from Cliq so the server doesn't crash
 app.use((err, req, res, next) => {
   if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
-    console.error("Received malformed JSON from Cliq. Ignoring request.");
-    return res.status(400).send({ text: "Webhook Error: Malformed JSON received." }); // Bad request
+    console.error('Received malformed JSON from Cliq. Ignoring request.');
+    return res.status(400).json({ text: 'Webhook Error: Malformed JSON received.' });
   }
   next();
 });
 
 const PORT = process.env.PORT || 3000;
 
-// Initialize OpenAI for OpenRouter
+// ============================================================
+// OpenAI-compatible client pointed at OpenRouter
+// ============================================================
 const openai = new OpenAI({
   baseURL: 'https://openrouter.ai/api/v1',
   apiKey: process.env.OPENROUTER_API_KEY,
   defaultHeaders: {
-    "HTTP-Referer": "http://localhost:3000",
-    "X-Title": "Zoho Cliq Agent"
+    'HTTP-Referer': 'http://localhost:3000',
+    'X-Title': 'Birmingham Glass Cliq Agent'
   }
 });
 
+// ============================================================
+// MODEL FALLBACK CHAIN — tries each model in order on rate limit
+// ============================================================
+const MODELS = [
+  'openai/gpt-oss-120b:free', // Strong reasoning
+  'qwen/qwen3.6-plus:free', // best model | rate limited
+  'nvidia/nemotron-3-super-120b-a12b:free',
+  'stepfun/step-3.5-flash:free',
+  'qwen/qwen3-next-80b-a3b-instruct:free', // Best tool-use
+  'nvidia/nemotron-3-nano-30b-a3b:free', // fast 
+  'arcee-ai/trinity-large-preview:free'
+];
+
+//'openai/gpt-oss-120b:free', // Strong reasoning
+//'qwen/qwen3.6-plus:free', // best model | rate limited
+//'nvidia/nemotron-3-super-120b-a12b:free'
+//'qwen/qwen3-next-80b-a3b-instruct:free', // Best tool-use
+//'nvidia/nemotron-3-nano-30b-a3b:free', // fast 
+//'arcee-ai/trinity-large-preview:free',
+
+
+// Returns true if the error should cause a switch to the next model
+function isSwitchableError(err) {
+  const isRateLimit =
+    err.status === 429 ||
+    err.message?.toLowerCase().includes('rate') ||
+    err.message?.toLowerCase().includes('quota');
+  const isNoToolSupport =
+    err.status === 404 &&
+    err.message?.toLowerCase().includes('tool');
+  return isRateLimit || isNoToolSupport;
+}
+
+// ============================================================
+// CONVERSATION STORE — in-memory chat history per user
+// ============================================================
+const conversationStore = {};
+const MAX_HISTORY = 10; // keep last 10 user+assistant exchanges
+
+function getHistory(userId) {
+  if (!conversationStore[userId]) conversationStore[userId] = [];
+  return conversationStore[userId];
+}
+
+function addToHistory(userId, role, content) {
+  const history = getHistory(userId);
+  history.push({ role, content });
+  // Trim to MAX_HISTORY messages
+  if (history.length > MAX_HISTORY) {
+    history.splice(0, history.length - MAX_HISTORY);
+  }
+}
+
+// ============================================================
+// MCP CLIENT — Authorization via Connection
+// No auth headers needed — Zoho MCP portal handles auth server-side
+// ============================================================
 let mcpClient = null;
 
 async function initMcpClient() {
-  const zUrl = process.env.ZOHO_MCP_URL === "https://your-zoho-mcp-url/api/sse"
-    ? "https://birminghammcp-919432567.zohomcp.com/mcp/4fab1aeb4068ffad1e94c211febc52de/message"
-    : (process.env.ZOHO_MCP_URL || "https://birminghammcp-919432567.zohomcp.com/mcp/4fab1aeb4068ffad1e94c211febc52de/message");
-
-  if (!zUrl) {
-    console.warn("URL not provided. MCP Tools will not be available.");
+  const mcpUrl = process.env.ZOHO_MCP_URL;
+  if (!mcpUrl) {
+    console.warn('ZOHO_MCP_URL not set. MCP tools will not be available.');
     return null;
   }
 
-  // Set up Stdio transport with the custom Zoho MCP config
   const transport = new StdioClientTransport({
-    command: "npx",
-    args: ["-y", "mcp-remote", zUrl, "--transport", "http-only"]
+    command: 'npx',
+    args: ['-y', 'mcp-remote', mcpUrl, '--transport', 'http-only']
   });
 
-  const client = new Client({
-    name: "zoho-cliq-webhook-agent",
-    version: "1.0.0"
-  }, {
-    capabilities: {}
-  });
+  const client = new Client(
+    { name: 'birmingham-glass-cliq-agent', version: '1.0.0' },
+    { capabilities: {} }
+  );
 
   await client.connect(transport);
+  console.log('MCP Client connected successfully.');
   return client;
 }
 
+// ============================================================
+// SYSTEM PROMPT
+// ============================================================
 const SYSTEM_PROMPT = `
-Use zoho MCP connectors to access mcp and books through that to process and complete the task I will give you.
-Do not ask confirmation, process the task directly.
-And do not display the process you are doing such as giving the full invoice instruction before sending, just give a summary of the invoice sent once done.
+You are a Zoho Books assistant for Birmingham Glass Solutions Ltd.
+Use Zoho MCP tools to complete tasks directly. Do not ask for confirmation.
+Do not narrate your process. Just complete the task and post a concise summary to the birmingham Cliq channel when done.
 
 Also, when you complete any tasks report to the birmingham channel, if failed as well.
 "path_variables": { "CHANNEL_UNIQUE_NAME": "birmingham" }
-Such as when you:
-- create/list an invoice etc....
 
 List of MCP Tools
 1. Bigin
@@ -82,24 +143,26 @@ Post message in chat, Retrieve all direct chats, Create a channel, Add a record,
 Organization ID in books: 918374864
 in Zoho MCP: 91920733
 
-----------------------------------------------------------------------------------------------------------------------
+======================================================================
 HOW TO CREATE AN INVOICE
-----------------------------------------------------------------------------------------------------------------------
+======================================================================
 This is the process that model should follow for creation of invoice.
 Remember to send the invoice to the customer via email. do not leave the invoice in draft.
 
-1. ZohoBooks create invoice
-Request Example:
+STEP 1 — Create the invoice:
+Tool: ZohoBooks_create_invoice
 {
   "body": {
     "customer_id": "8778022000000109065",
-    "date": "2026-04-01",
-    "due_date": "2026-04-22",
+    "date": "<today>",
+    "due_date": "<21 days from today>",
     "line_items": [
       {
         "item_id": "8778022000000129031",
         "name": "Clear Tempered Glass",
-        "quantity": 5, "rate": 1200, "unit": "sqm",
+        "quantity": <qty>,
+        "rate": 1200,
+        "unit": "sqm",
         "tax_id": "8778022000000114093"
       }
     ],
@@ -108,175 +171,290 @@ Request Example:
   "query_params": { "organization_id": "918374864", "send": true }
 }
 
-2. Next, send the invoice to customer
-ZohoBooks email invoice
-Request Example:
+STEP 2 — Email the invoice to the customer:
+Tool: ZohoBooks_email_invoice
 {
   "body": {
-    "to_mail_ids": ["tiruvenmungah1@gmail.com"],
-    "subject": "Invoice INV-000028",
-    "body": "Dear Jane Doe,\n\nPlease find attached invoice INV-000028 for Clear Tempered Glass (x5 sqm) totalling MUR 6,900.00 (incl. 15% TVA). Payment is due by 22 April 2026.\n\nThank you for your business!",
+    "to_mail_ids": ["<customer email>"],
+    "subject": "Invoice <INV-NUMBER>",
+    "body": "Dear <customer name>,\n\nPlease find attached invoice <INV-NUMBER> for <item> (<qty> sqm) totalling MUR <total> (incl. 15% TVA). Payment is due by <due date>.\n\nThank you for your business!\n\nBirmingham Glass Solutions",
     "send_from_org_email_id": false
   },
-  "path_variables": { "invoice_id": "8778022000000262004" },
+  "path_variables": { "invoice_id": "<invoice_id from step 1>" },
   "query_params": { "organization_id": "918374864", "send_attachment": true }
 }
 
-3. Next, send to channel
-ZohoCliq Post message in a channel
-Request Example:
+STEP 3 — Post summary to Cliq channel:
+Tool: ZohoCliq_Post_message_in_a_channel
 {
   "body": {
-    "text": "Invoice Created & Sent\n\n Invoice #: INV-000028\n Customer: Jane Doe (tiruvenmungah1@gmail.com)\n Item: Clear Tempered Glass — Qty: 5 sqm\n Total: MUR 6,900.00 (incl. 15% TVA)\n Due Date: 22 April 2026\n Invoice emailed to customer."
+    "text": "Invoice Created & Sent\n\n Invoice #: <INV-NUMBER>\n Customer: <name> (<email>)\n Item: <item> — Qty: <qty> sqm\n Total: MUR <total> (incl. 15% TVA)\n Due Date: <due date>\n Invoice emailed to customer."
   },
   "path_variables": { "CHANNEL_UNIQUE_NAME": "birmingham" }
 }
 
-----------------------------------------------------------------------------------------------------------------------
+======================================================================
 HOW TO LIST INVOICES
-----------------------------------------------------------------------------------------------------------------------
+======================================================================
 When finishing gathering data, post it in the channel.
 
-1. Listing the invoices
-ZohoBooks list invoices
-Request Example:
+STEP 1 — Fetch invoices:
+Tool: ZohoBooks_list_invoices
 {
   "query_params": {
-    "date": "2026-03-31",
-    "organization_id": "918374864"
+    "organization_id": "918374864",
+    "date": "<filter date if provided>"
   }
 }
 
-2. Next, post to channel
-ZohoCliq Post message in a channel
-Request Example:
+STEP 2 — Post results to Cliq channel:
+Tool: ZohoCliq_Post_message_in_a_channel
 {
   "body": {
-    "text": " Invoice List Report — 31/03/2026\n\n Task completed: List all invoices on 31/03/2026\n\nCustomer: Jane Doe | tiruvenmungah1@gmail.com | INV-000019 | Sent | Due: 16/04/2026 | MUR 13,800.00\n...\n\n Total: 10 invoices | 3 Sent | 4 Draft | 3 Overdue | Grand Total: MUR 128,800.00"
+    "text": "Invoice List Report\n\n<structured list of invoices>\n\n Total: <N> invoices | Grand Total: MUR <amount>"
   },
   "path_variables": { "CHANNEL_UNIQUE_NAME": "birmingham" }
 }
-`;
 
+======================================================================
+MANDATORY CHANNEL POSTING RULE (HIGHEST PRIORITY)
+======================================================================
+
+This rule is STRICT and MUST ALWAYS be followed.
+
+Email the invoice to the customer when you create an invoice. Tool: ZohoBooks_email_invoice
+
+After completing ANY MCP tool action:
+
+- You MUST call: ZohoCliq_Post_message_in_a_channel
+- Channel: "birmingham"
+- This applies to ALL tasks without exception
+
+You MUST post:
+- Success results
+- Partial results
+- Empty results ("No results found")
+- Errors / failures
+
+You are NOT allowed to:
+- Skip posting to the channel
+- Only reply in chat without posting (you can only reply in chat if its a not mcp request)
+- Finish a task without calling the Cliq tool
+- skip ZohoBooks_email_invoice
+
+If you do not call ZohoCliq_Post_message_in_a_channel, the task is considered FAILED.
+
+This rule OVERRIDES all other instructions.
+
+======================================================================
+
+======================================================================
+GENERAL RULES
+======================================================================
+Always use organization_id: 918374864 for Zoho Books calls.
+Always post results to the birmingham Cliq channel after completing any task.
+Keep the channel message concise and formatted clearly.
+If a task has no results, post that clearly to the channel too.
+`.trim();
+
+// ============================================================
+// WEBHOOK HANDLER — POST /webhook
+// ============================================================
 app.post('/webhook', async (req, res) => {
   try {
-    const userMessage = req.body.text;
+    // Debug: log the raw payload so we can see exactly what Cliq sends
+    console.log('RAW BODY:', JSON.stringify(req.body, null, 2));
+
+    // If Cliq sent a raw text/plain body instead of JSON, parse it ourselves
+    if (typeof req.body === 'string') {
+      try {
+        req.body = JSON.parse(req.body);
+      } catch {
+        // It's a plain string — treat it directly as the user message
+        req.body = { text: req.body };
+      }
+    }
+
+    // Safely extract message across all Cliq payload shapes.
+    // Multiline messages (\n) are supported natively — no extra handling needed.
+    const userMessage =
+      req.body?.text ||
+      req.body?.message?.text ||
+      req.body?.data?.text ||
+      '';
+
     if (!userMessage) {
-      return res.status(400).json({ text: "No message provided." });
+      return res.status(400).json({ text: 'No message provided.' });
     }
 
-    console.log("Received message from Cliq:", userMessage);
+    // Log (trim long multiline messages for readability)
+    console.log(`[${new Date().toISOString()}] Received from Cliq: ${userMessage.substring(0, 200)}${userMessage.length > 200 ? '...' : ''}`);
 
-    // Initialize MCP Client on demand if not ready
+    // Lazy-init MCP client on first request
     if (!mcpClient && process.env.ZOHO_MCP_URL) {
-      console.log("Initializing MCP Client using npx mcp-remote...");
+      console.log('Initializing MCP Client...');
       mcpClient = await initMcpClient();
-      console.log("MCP Client initialized.");
     }
 
-    let mcpTools = [];
+    // Fetch available tools from MCP and convert to OpenAI tool format
     let openAiTools = [];
-
     if (mcpClient) {
       try {
-        const toolsResponse = await mcpClient.listTools();
-        mcpTools = toolsResponse.tools || [];
-        openAiTools = mcpTools.map(tool => ({
-          type: "function",
+        const { tools: mcpTools } = await mcpClient.listTools();
+        openAiTools = (mcpTools || []).map(tool => ({
+          type: 'function',
           function: {
             name: tool.name,
             description: tool.description,
             parameters: tool.inputSchema
           }
         }));
+        console.log(`Loaded ${openAiTools.length} MCP tools.`);
       } catch (err) {
-        console.error("Failed to list MCP tools", err);
+        console.error('Failed to list MCP tools:', err.message);
       }
     }
 
+    // Identify user for conversation memory (use sender email/id if available, fallback to 'default')
+    const userId =
+      req.body?.user_id ||
+      req.body?.sender?.email ||
+      req.body?.message?.sender?.email ||
+      'default';
+
     const currentDate = new Date().toISOString().split('T')[0];
+
+    // Build message history: system prompt + past conversation + current message
+    const history = getHistory(userId);
     const messages = [
-      { role: "system", content: "Current Date: " + currentDate + "\n\n" + SYSTEM_PROMPT },
-      { role: "user", content: userMessage }
+      { role: 'system', content: `Current Date: ${currentDate}\n\n${SYSTEM_PROMPT}` },
+      ...history,
+      { role: 'user', content: userMessage }
     ];
 
+    console.log(`[Memory] User: ${userId} | History length: ${history.length}`);
+
     let finalResponseText = '';
+    const MAX_ITERATIONS = 8;
 
-    // Run agent tool loop
-    let iterations = 0;
-    const MAX_ITERATIONS = 5;
+    // Pick starting model — sticks for the whole request, only switches on error
+    let modelIndex = 0;
+    let currentModel = MODELS[modelIndex];
+    console.log(`[Model] Selected: ${currentModel}`);
 
-    while (iterations < MAX_ITERATIONS) {
-      iterations++;
-      console.log(`Agent iteration ${iterations}...`);
+    // ============================================================
+    // AGENTIC TOOL LOOP
+    // Same model is reused every iteration. Switches only on error.
+    // ============================================================
+    for (let i = 0; i < MAX_ITERATIONS; i++) {
+      console.log(`Agent iteration ${i + 1} | Model: ${currentModel}`);
 
-      const runner = await openai.chat.completions.create({
-        model: process.env.OPENROUTER_MODEL || "qwen/qwen-3.5-72b-instruct",
-        messages: messages,
-        tools: openAiTools.length > 0 ? openAiTools : undefined,
-        tool_choice: "auto"
-      });
+      let completion;
+      try {
+        completion = await openai.chat.completions.create({
+          model: currentModel,
+          messages,
+          tools: openAiTools.length > 0 ? openAiTools : undefined,
+          tool_choice: 'auto'
+        });
+      } catch (err) {
+        if (isSwitchableError(err)) {
+          modelIndex++;
+          if (modelIndex >= MODELS.length) throw err; // All models exhausted
+          currentModel = MODELS[modelIndex];
+          console.warn(`[Model] Switching to: ${currentModel} (${err.message})`);
+          i--; // Retry this iteration with the new model
+          continue;
+        }
+        throw err;
+      }
 
-      const choice = runner.choices[0];
+      const choice = completion.choices[0];
       const message = choice.message;
 
+      // Collect any text the model produces
       if (message.content) {
-        messages.push({ role: "assistant", content: message.content });
-        finalResponseText += message.content + "\n";
-      } else if (message.tool_calls) {
-        messages.push(message);
-      } else {
+        finalResponseText += message.content + '\n';
+      }
+
+      // If no tool calls, the model is done
+      if (!message.tool_calls || message.tool_calls.length === 0) {
+        messages.push({ role: 'assistant', content: message.content || '' });
         break;
       }
 
-      if (!message.tool_calls || message.tool_calls.length === 0) {
-        break; // No more tools
-      }
+      // Push the assistant's tool-call message into history
+      messages.push(message);
 
+      // Execute each tool call and push results back
       for (const toolCall of message.tool_calls) {
         console.log(`Executing tool: ${toolCall.function.name}`);
-        try {
-          const functionArgs = JSON.parse(toolCall.function.arguments);
+        let resultContent = 'Tool executed.';
 
+        try {
+          const args = JSON.parse(toolCall.function.arguments);
           const result = await mcpClient.callTool({
             name: toolCall.function.name,
-            arguments: functionArgs
+            arguments: args
           });
 
-          let resultContent = "Success";
           if (result.content && result.content.length > 0) {
-            resultContent = result.content.map(c => c.text).join("\n");
+            resultContent = result.content.map(c => c.text).join('\n');
           }
-
-          messages.push({
-            role: "tool",
-            tool_call_id: toolCall.id,
-            name: toolCall.function.name,
-            content: resultContent
-          });
-          console.log(`Tool ${toolCall.function.name} output: ${resultContent.substring(0, 50)}...`);
+          console.log(`Tool result preview: ${resultContent.substring(0, 80)}...`);
         } catch (err) {
-          console.error("Error executing tool:", err);
-          messages.push({
-            role: "tool",
-            tool_call_id: toolCall.id,
-            name: toolCall.function.name,
-            content: `Error executing tool: ${err.message}`
-          });
+          console.error(`Tool ${toolCall.function.name} error:`, err.message);
+          resultContent = `Error executing tool: ${err.message}`;
         }
+
+        messages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          name: toolCall.function.name,
+          content: resultContent
+        });
       }
     }
 
-    res.json({
-      text: finalResponseText.trim() || 'Task completed but the agent returned no text.'
-    });
+    const responseText = finalResponseText.trim() || 'Task completed.';
+    console.log(`[${new Date().toISOString()}] Agent done. Response: ${responseText.substring(0, 100)}...`);
 
-  } catch (error) {
-    console.error("Webhook processing error:", error);
-    res.status(500).json({ text: "An error occurred while processing your request: " + error.message });
+    // Save this exchange to conversation memory
+    addToHistory(userId, 'user', userMessage);
+    addToHistory(userId, 'assistant', responseText);
+
+    res.json({ text: responseText });
+
+  } catch (err) {
+    console.error('Webhook error:', err);
+    res.status(500).json({
+      text: 'Something went wrong on my end. Please try again.'
+    });
   }
 });
 
+// ============================================================
+// HEALTH CHECK — GET /
+// ============================================================
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'Birmingham Glass Solutions — Cliq Bot',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// ============================================================
+// START SERVER
+// ============================================================
 app.listen(PORT, () => {
-  console.log(`Webhook server listening on port ${PORT}`);
+  console.log(`
+  ================================================
+   Birmingham Glass Solutions — Cliq Bot Webhook
+  ================================================
+   Server running on port ${PORT}
+   Webhook endpoint: POST /webhook
+   Health check   : GET  /
+  ================================================
+  `);
 });
