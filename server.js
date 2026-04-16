@@ -577,7 +577,7 @@ MANDATORY RULES
 ======================================================================
 
 CONFIG:
-Zoho Books Org ID: 918374864
+Zoho Books Org ID: 912032060
 Zoho MCP Org: 920887582
 Cliq Channel: birmingham
 Zoho Mail Account ID: 2054645000000009002
