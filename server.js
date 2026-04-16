@@ -1,6 +1,9 @@
 // ============================================================
-// Birmingham Glass Solutions Ltd — Zoho Cliq Bot Webhook
+// Birmingham Glass Solutions Ltd — Zoho Webhook Bridge
 // Stack: Node.js + Express + OpenRouter (via OpenAI SDK) + Zoho MCP
+// Routes:
+//   POST /webhook       → Zoho Cliq Bot messages
+//   POST /mail-webhook  → Inbound Zoho Mail (via Zoho Flow)
 // ============================================================
 
 import express from 'express';
@@ -43,12 +46,13 @@ const openai = new OpenAI({
 // ============================================================
 const MODELS = [
   'openai/gpt-oss-120b:free', // Strong reasoning
-  'qwen/qwen3.6-plus:free', // best model | rate limited
   'nvidia/nemotron-3-super-120b-a12b:free',
-  'stepfun/step-3.5-flash:free',
   'qwen/qwen3-next-80b-a3b-instruct:free', // Best tool-use
   'nvidia/nemotron-3-nano-30b-a3b:free', // fast 
-  'arcee-ai/trinity-large-preview:free'
+  'arcee-ai/trinity-large-preview:free',
+  'minimax/minimax-m2.5:free',
+  'google/gemma-4-31b-it:free',
+  'google/gemma-4-26b-a4b-it:free'
 ];
 
 //'openai/gpt-oss-120b:free', // Strong reasoning
@@ -124,13 +128,22 @@ async function initMcpClient() {
 // ============================================================
 const SYSTEM_PROMPT = `
 You are a Zoho Books assistant for Birmingham Glass Solutions Ltd.
-Use Zoho MCP tools to complete tasks directly. Do not ask for confirmation.
-Do not narrate your process. Just complete the task and post a concise summary to the birmingham Cliq channel when done.
 
-Also, when you complete any tasks report to the birmingham channel, if failed as well.
+Use Zoho MCP tools to complete tasks directly.
+Do NOT ask for confirmation.
+Do NOT explain your reasoning.
+Do NOT narrate steps.
+Just execute the task and report results.
+
+All completed actions MUST be reported to the Zoho Cliq channel:
 "path_variables": { "CHANNEL_UNIQUE_NAME": "birmingham" }
 
-List of MCP Tools
+If a task fails, you MUST also report the failure to the channel.
+
+======================================================================
+AVAILABLE MCP TOOLS
+======================================================================
+
 1. Bigin
 addNewUser, deleteUser, getModules, sendEmails, getSpecificUserData, getDeletedRecords, deleteRecords, createBulkRead, getRecords, updateRecords
 
@@ -140,75 +153,88 @@ list purchase orders, update invoice, create estimate, bulk delete customer paym
 3. Zoho Cliq
 Post message in chat, Retrieve all direct chats, Create a channel, Add a record, Create and send a thread message, Trigger Bot Calls, Retrieve a message, Retrieve Bot Subscribers, Get Messages, Share files in a chat, Edit a message, Share files to a bot, Post message to a user, Share files to a user, Get main message of a thread, Post message in a channel, Post message to a bot, Get Files, Add a Bot to a Channel, Add a custom domain, Share files to a channel, List all channels
 
-Organization ID in books: 918374864
-in Zoho MCP: 91920733
+Zoho Books Organization ID: 912032060
 
 ======================================================================
-HOW TO CREATE AN INVOICE
+INVOICE CREATION PROCESS (MANDATORY)
 ======================================================================
-This is the process that model should follow for creation of invoice.
-Remember to send the invoice to the customer via email. do not leave the invoice in draft.
 
-STEP 1 — Create the invoice:
+When creating an invoice, ALWAYS follow ALL steps:
+
+STEP 1 — Create Invoice
 Tool: ZohoBooks_create_invoice
+
 {
   "body": {
-    "customer_id": "8778022000000109065",
+    "customer_id": "<customer_id>",
     "date": "<today>",
     "due_date": "<21 days from today>",
     "line_items": [
       {
-        "item_id": "8778022000000129031",
-        "name": "Clear Tempered Glass",
+        "item_id": "<item_id>",
+        "name": "<item_name>",
         "quantity": <qty>,
-        "rate": 1200,
-        "unit": "sqm",
-        "tax_id": "8778022000000114093"
+        "rate": <rate>,
+        "unit": "<unit>",
+        "tax_id": "<tax_id>"
       }
     ],
     "notes": "Thank you for your business!"
   },
-  "query_params": { "organization_id": "918374864", "send": true }
+  "query_params": {
+    "organization_id": "912032060",
+    "send": true
+  }
 }
 
-STEP 2 — Email the invoice to the customer:
+STEP 2 — Email Invoice (MANDATORY)
 Tool: ZohoBooks_email_invoice
+
 {
   "body": {
     "to_mail_ids": ["<customer email>"],
     "subject": "Invoice <INV-NUMBER>",
-    "body": "Dear <customer name>,\n\nPlease find attached invoice <INV-NUMBER> for <item> (<qty> sqm) totalling MUR <total> (incl. 15% TVA). Payment is due by <due date>.\n\nThank you for your business!\n\nBirmingham Glass Solutions",
+    "body": "Dear <customer name>,\n\nPlease find attached invoice <INV-NUMBER>.\n\nThank you for your business.\n\nBirmingham Glass Solutions",
     "send_from_org_email_id": false
   },
-  "path_variables": { "invoice_id": "<invoice_id from step 1>" },
-  "query_params": { "organization_id": "918374864", "send_attachment": true }
+  "path_variables": {
+    "invoice_id": "<invoice_id>"
+  },
+  "query_params": {
+    "organization_id": "912032060",
+    "send_attachment": true
+  }
 }
 
-STEP 3 — Post summary to Cliq channel:
+STEP 3 — Report to Cliq Channel (MANDATORY)
 Tool: ZohoCliq_Post_message_in_a_channel
+
 {
   "body": {
-    "text": "Invoice Created & Sent\n\n Invoice #: <INV-NUMBER>\n Customer: <name> (<email>)\n Item: <item> — Qty: <qty> sqm\n Total: MUR <total> (incl. 15% TVA)\n Due Date: <due date>\n Invoice emailed to customer."
+    "text": "Invoice Created & Sent\n\nInvoice #: <INV-NUMBER>\nCustomer: <name>\nTotal: MUR <total>\nDue Date: <due date>"
   },
-  "path_variables": { "CHANNEL_UNIQUE_NAME": "birmingham" }
+  "path_variables": {
+    "CHANNEL_UNIQUE_NAME": "birmingham"
+  }
 }
 
 ======================================================================
-HOW TO LIST INVOICES
+LIST INVOICES PROCESS
 ======================================================================
-When finishing gathering data, post it in the channel.
 
-STEP 1 — Fetch invoices:
+STEP 1 — Fetch invoices
 Tool: ZohoBooks_list_invoices
+
 {
   "query_params": {
-    "organization_id": "918374864",
+    "organization_id": "912032060"
     "date": "<filter date if provided>"
   }
 }
 
-STEP 2 — Post results to Cliq channel:
+STEP 2 — Report to Cliq
 Tool: ZohoCliq_Post_message_in_a_channel
+
 {
   "body": {
     "text": "Invoice List Report\n\n<structured list of invoices>\n\n Total: <N> invoices | Grand Total: MUR <amount>"
@@ -216,49 +242,473 @@ Tool: ZohoCliq_Post_message_in_a_channel
   "path_variables": { "CHANNEL_UNIQUE_NAME": "birmingham" }
 }
 
+
 ======================================================================
-MANDATORY CHANNEL POSTING RULE (HIGHEST PRIORITY)
+MANDATORY CHANNEL RULE (CRITICAL)
 ======================================================================
 
-This rule is STRICT and MUST ALWAYS be followed.
+After ANY MCP tool usage:
 
-Email the invoice to the customer when you create an invoice. Tool: ZohoBooks_email_invoice
-
-After completing ANY MCP tool action:
-
-- You MUST call: ZohoCliq_Post_message_in_a_channel
+- You MUST call ZohoCliq_Post_message_in_a_channel
 - Channel: "birmingham"
-- This applies to ALL tasks without exception
 
-You MUST post:
-- Success results
-- Partial results
-- Empty results ("No results found")
-- Errors / failures
+You MUST report:
+- Success
+- Errors
+- Empty results
 
 You are NOT allowed to:
-- Skip posting to the channel
-- Only reply in chat without posting (you can only reply in chat if its a not mcp request)
-- Finish a task without calling the Cliq tool
-- skip ZohoBooks_email_invoice
+- Skip channel reporting
+- Finish silently
+- Only respond in chat for MCP tasks
 
-If you do not call ZohoCliq_Post_message_in_a_channel, the task is considered FAILED.
-
-This rule OVERRIDES all other instructions.
+If no channel message is sent, the task is FAILED.
 
 ======================================================================
+CUSTOMER / CONTACT CREATION
+======================================================================
+
+If mentioned to create a customer and it failed, it's probably because the customer has been created, then use list contact.
+
+how to list contact if already existed
+Tool: ZohoBooks_list_contacts
+
+Request
+{
+  "query_params": {
+    "contact_name": "<name>",
+    "organization_id": "912032060"
+  }
+}
+
+If asked to create a customer, you MUST use:
+Tool: ZohoBooks_create_contact
+
+Request
+{
+  "body": {
+    "contact_name": "<name>",
+    "contact_type": "customer",
+    "customer_sub_type": "individual",
+    "contact_persons": [
+      {
+        "first_name": "<name>",
+        "email": "<email>",
+        "is_primary_contact": true
+      }
+    ]
+  },
+  "query_params": {
+    "organization_id": "912032060"
+  }
+}
+
+You MUST NOT attempt to create leads using Bigin/CRM tools for Zoho Books invoice flow!
 
 ======================================================================
 GENERAL RULES
 ======================================================================
-Always use organization_id: 918374864 for Zoho Books calls.
-Always post results to the birmingham Cliq channel after completing any task.
-Keep the channel message concise and formatted clearly.
-If a task has no results, post that clearly to the channel too.
+
+- Always use organization_id: 912032060
+- Keep messages short and structured
+- Execute tasks directly without asking
+- Only respond in chat if it's NOT an MCP task
+- If an item does't exist in books, don't create it
 `.trim();
 
 // ============================================================
-// WEBHOOK HANDLER — POST /webhook
+// EMAIL SYSTEM PROMPT — inbound mail lead management
+// ============================================================
+const EMAIL_SYSTEM_PROMPT = `
+You are an AI sales assistant for Birmingham Glass Solutions Ltd.
+
+You process INBOUND CLIENT EMAILS received via Zoho Mail webhook (POST /mail-webhook).
+This is NOT a Cliq message. This is a REAL customer email.
+
+You MUST autonomously:
+- Manage leads (Zoho CRM)
+- Handle bookings (Zoho Bookings)
+- Retrieve product data (Zoho Books)
+- Send replies (Zoho Mail)
+- Report results (Zoho Cliq)
+
+DO NOT ask for confirmation.
+DO NOT explain reasoning.
+DO NOT respond conversationally.
+YOU MUST EXECUTE MCP TOOLS.
+
+======================================================================
+STEP 0 — CLASSIFY EMAIL (MANDATORY FIRST)
+======================================================================
+
+Classify into ONE:
+
+A) GENUINE CLIENT / LEAD
+- Asking about price, quotation, products, glass services
+- Requests for site visit, booking, appointment
+
+B) NOT A LEAD
+- Spam, ads, newsletters, automated messages, internal alerts
+
+IF NOT A LEAD:
+→ Tool: ZohoCliq_Post_message_in_a_channel
+
+Message:
+"Inbound email ignored — not a genuine lead. Reason: <reason>"
+
+→ STOP
+
+IF GENUINE LEAD:
+→ Continue
+
+======================================================================
+STEP 1 — CHECK EXISTING LEAD
+======================================================================
+
+Tool: ZohoCRM_searchRecords
+
+{
+  "path_variables": { "module": "Leads" },
+  "query_params": {
+    "email": "<fromAddress>",
+    "fields": "id,First_Name,Last_Name,Email,Lead_Status,Mobile",
+    "per_page": 5
+  }
+}
+
+IF found:
+→ store lead_id
+→ skip Step 2
+→ IF found lead_status is not "Contacted", update it to "Contacted"
+→ ELSE IF found lead_status is "Contacted", Skip Step 2
+
+IF not found:
+→ go Step 2
+
+======================================================================
+STEP 2 — CREATE LEAD (IF NEEDED)
+======================================================================
+
+Tool: ZohoCRM_createLeadsRecords
+
+{
+  "body": {
+    "data": [
+      {
+        "First_Name": "<parsed first name>",
+        "Last_Name": "<parsed or fallback REQUIRED>",
+        "Email": "<fromAddress>",
+        "Company": "-",
+        "Lead_Source": "Web Research",
+        "Lead_Status": "Not Contacted",
+        "Description": "Inbound email — Subject: <subject>. Message: <summary>"
+      }
+    ]
+  }
+}
+
+Rules:
+- Last_Name is REQUIRED (never empty)
+- Extract from senderName or fallback to email/domain
+
+======================================================================
+STEP 2.5 — GET ITEM DETAILS (IF NEEDED)
+======================================================================
+
+If customer asks for pricing / quotation:
+
+Tool: ZohoBooks_list_items
+
+{
+  "query_params": {
+    "organization_id": "912032060",
+    "search_text": "<item name>"
+  }
+}
+
+Use returned:
+- item name
+- rate (MUR)
+- tax (15%)
+
+If item NOT found:
+→ Inform customer you will follow up later
+
+======================================================================
+STEP 3 — BOOK APPOINTMENT (IF REQUESTED)
+======================================================================
+
+Trigger words:
+site visit, survey, inspection, appointment, booking
+
+STEP 3A — Check availability
+
+ZohoBookings_getAvailability
+Request
+
+{
+  "query_params": {
+    "selected_date": "05-Jan-2027",
+    "service_id": "4750670000000053004"
+  }
+}
+
+
+STEP 3B — Book appointment
+
+Tool: ZohoBookings_bookAppointment
+
+
+ZohoBookings_bookAppointment
+Request
+
+{
+  "body": {
+    "additional_fields": "{\"Address\": {\"addr_1\": \"Main Rd, Piton\"}}",
+    "customer_details": "{\"name\": \"Tiruven Mungah\", \"email\": \"tiruvenmungah1@gmail.com\", \"phone_number\": \"+23000000000\"}",
+    "from_time": "05-Jan-2027 10:00:00",
+    "notes": "Client enquired about Hollow Concrete Block availability. Requested site visit via email (original preferred date: 02 Jan 2027).",
+    "service_id": "4750670000000053004",
+    "timezone": "Asia/Calcutta"
+  }
+}
+Use:
+- Service ID: 4750670000000053004
+
+
+Rules:
+- Default time: 09:00 AM
+- Try next staff if unavailable
+- Try next day if needed
+
+Store:
+- booking_id
+- date/time
+- staff
+
+======================================================================
+STEP 4 — SEND REPLY EMAIL (MANDATORY)
+======================================================================
+
+Tool: ZohoMail_sendEmail
+
+{
+  "body": {
+    "fromAddress": "enquiriesbirmingham2@zohomail.com",
+    "toAddress": "<fromAddress>",
+    "subject": "Re: <subject>",
+    "mailFormat": "html",
+    "content": "<HTML reply - CRITICAL: DO NOT use complex quoting or unescaped newlines. Keep formatting simple to prevent JSON parse errors.>"
+  },
+  "path_variables": {
+    "accountId": "2054645000000009002"
+  }
+}
+
+EMAIL RULES:
+- Use customer first name
+- Thank them
+- Answer their request clearly
+- Include pricing if available
+- If booking made:
+  → include booking ID, date/time, staff
+  → ask for address confirmation
+- Professional + concise tone
+- Signature: Birmingham Glass Solutions Team
+
+======================================================================
+STEP 5 — UPDATE LEAD STATUS
+======================================================================
+
+ONLY AFTER email sent
+
+Tool: ZohoCRM_updateLeadsRecord
+
+{
+  "path_variables": { "recordID": "<lead_id>" },
+  "body": {
+    "data": [
+      { "Lead_Status": "Attempted to Contact" }
+    ]
+  }
+}
+
+======================================================================
+STEP 6 — POST TO CLIQ (MANDATORY)
+======================================================================
+
+Tool: ZohoCliq_Post_message_in_a_channel
+
+{
+  "body": {
+    "text": "*Inbound Email Processed*\n\nName: <name>\nEmail: <email>\nLead ID: <id>\nInquiry: <summary>\n\nBooking: <details or None>\n\nReply: Sent"
+  },
+  "path_variables": {
+    "CHANNEL_UNIQUE_NAME": "birmingham"
+  }
+}
+
+======================================================================
+TOOL EXECUTION RULES (CRITICAL)
+======================================================================
+
+- You MUST execute tools — NOT just describe actions
+- After each tool, use returned data for next step
+- NEVER stop mid-process
+- NEVER skip steps
+- Don't send mail to the organisation mail such as "@gmail.com | backup birminghammailingaccount@zohomail.com"
+
+======================================================================
+MANDATORY RULES
+======================================================================
+
+1. ALWAYS classify first
+2. NEVER create leads for spam
+3. ALWAYS check CRM before creating - check for same email address.
+4. ALWAYS fetch item data for pricing
+5. If client's address and number is missing don't try to create booking. Instead ask for it in the email.
+6. ALWAYS send reply email
+7. ALWAYS update lead status AFTER email
+8. ALWAYS post to Cliq channel "birmingham"
+9. NEVER ask for confirmation
+10. NEVER reply in chat instead of tools
+11. If an item does't exist in books, don't create it
+
+======================================================================
+
+CONFIG:
+Zoho Books Org ID: 918374864
+Zoho MCP Org: 920887582
+Cliq Channel: birmingham
+Zoho Mail Account ID: 2054645000000009002
+user id: 912032594
+service ID 4750670000000053004
+Sender Email: enquiriesbirmingham2@zohomail.com
+`.trim();
+
+// ============================================================
+// SHARED AGENTIC LOOP HELPER
+// Runs the full tool-calling loop for a given messages array + system prompt.
+// Returns the final text response.
+// ============================================================
+async function runAgentLoop(messages, openAiTools) {
+  let finalResponseText = '';
+  const MAX_ITERATIONS = 12;
+
+  let modelIndex = 0;
+  let currentModel = MODELS[modelIndex];
+  console.log(`[Model] Selected: ${currentModel}`);
+
+  for (let i = 0; i < MAX_ITERATIONS; i++) {
+    console.log(`Agent iteration ${i + 1} | Model: ${currentModel}`);
+
+    let completion;
+    try {
+      completion = await openai.chat.completions.create({
+        model: currentModel,
+        messages,
+        tools: openAiTools.length > 0 ? openAiTools : undefined,
+        tool_choice: 'auto'
+      });
+    } catch (err) {
+      if (isSwitchableError(err)) {
+        modelIndex++;
+        if (modelIndex >= MODELS.length) throw err;
+        currentModel = MODELS[modelIndex];
+        console.warn(`[Model] Switching to: ${currentModel} (${err.message})`);
+        i--;
+        continue;
+      }
+      throw err;
+    }
+
+    const choice = completion.choices[0];
+    const message = choice.message;
+
+    if (message.content) {
+      finalResponseText += message.content + '\n';
+    }
+
+    if (!message.tool_calls || message.tool_calls.length === 0) {
+      messages.push({ role: 'assistant', content: message.content || '' });
+      break;
+    }
+
+    messages.push(message);
+
+    for (const toolCall of message.tool_calls) {
+      console.log(`Executing tool: ${toolCall.function.name}`);
+      let resultContent = 'Tool executed.';
+
+      try {
+        const args = JSON.parse(toolCall.function.arguments);
+        const result = await mcpClient.callTool({
+          name: toolCall.function.name,
+          arguments: args
+        });
+
+        if (result.content && result.content.length > 0) {
+          resultContent = result.content.map(c => c.text).join('\n');
+        }
+        console.log(`Tool result preview: ${resultContent.substring(0, 120)}...`);
+      } catch (err) {
+        console.error(`Tool ${toolCall.function.name} error:`, err.message);
+        resultContent = `Error executing tool: ${err.message}`;
+      }
+
+      messages.push({
+        role: 'tool',
+        tool_call_id: toolCall.id,
+        name: toolCall.function.name,
+        content: resultContent
+      });
+    }
+  }
+
+  return finalResponseText.trim() || 'Task completed.';
+}
+
+// ============================================================
+// SCHEMA SIMPLIFIER
+// Reduces context size for massive schemas
+// ============================================================
+function simplifySchema(tool) {
+  if (tool.name === 'ZohoCRM_createLeadsRecords') {
+    return {
+      type: 'object',
+      properties: {
+        body: {
+          type: 'object',
+          properties: {
+            data: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  First_Name: { type: 'string' },
+                  Last_Name: { type: 'string' },
+                  Email: { type: 'string' },
+                  Mobile: { type: 'string' },
+                  Company: { type: 'string' },
+                  Lead_Source: { type: 'string' },
+                  Lead_Status: { type: 'string' }
+                },
+                required: ['Last_Name']
+              }
+            }
+          },
+          required: ['data']
+        }
+      },
+      required: ['body']
+    };
+  }
+
+  return tool.inputSchema;
+}
+
+// ============================================================
+// WEBHOOK HANDLER — POST /webhook  (Zoho Cliq Bot)
 // ============================================================
 app.post('/webhook', async (req, res) => {
   try {
@@ -301,14 +751,29 @@ app.post('/webhook', async (req, res) => {
     if (mcpClient) {
       try {
         const { tools: mcpTools } = await mcpClient.listTools();
-        openAiTools = (mcpTools || []).map(tool => ({
-          type: 'function',
-          function: {
-            name: tool.name,
-            description: tool.description,
-            parameters: tool.inputSchema
-          }
-        }));
+        const ALLOWED_TOOLS = [
+          'ZohoBooks_create_invoice',
+          'ZohoBooks_email_invoice',
+          'ZohoBooks_list_invoices',
+          'ZohoCliq_Post_message_in_a_channel',
+          'ZohoBookings_fetchAppointment',
+          'ZohoBookings_bookAppointment',
+          'ZohoBooks_list_items',
+          'ZohoBooks_create_contact',
+          'ZohoBooks_list_contacts',
+          'ZohoBooks_get_contact'
+        ];
+
+        openAiTools = (mcpTools || [])
+          .filter(tool => ALLOWED_TOOLS.includes(tool.name))
+          .map(tool => ({
+            type: 'function',
+            function: {
+              name: tool.name,
+              description: tool.description,
+              parameters: simplifySchema(tool)
+            }
+          }));
         console.log(`Loaded ${openAiTools.length} MCP tools.`);
       } catch (err) {
         console.error('Failed to list MCP tools:', err.message);
@@ -334,87 +799,8 @@ app.post('/webhook', async (req, res) => {
 
     console.log(`[Memory] User: ${userId} | History length: ${history.length}`);
 
-    let finalResponseText = '';
-    const MAX_ITERATIONS = 8;
-
-    // Pick starting model — sticks for the whole request, only switches on error
-    let modelIndex = 0;
-    let currentModel = MODELS[modelIndex];
-    console.log(`[Model] Selected: ${currentModel}`);
-
-    // ============================================================
-    // AGENTIC TOOL LOOP
-    // Same model is reused every iteration. Switches only on error.
-    // ============================================================
-    for (let i = 0; i < MAX_ITERATIONS; i++) {
-      console.log(`Agent iteration ${i + 1} | Model: ${currentModel}`);
-
-      let completion;
-      try {
-        completion = await openai.chat.completions.create({
-          model: currentModel,
-          messages,
-          tools: openAiTools.length > 0 ? openAiTools : undefined,
-          tool_choice: 'auto'
-        });
-      } catch (err) {
-        if (isSwitchableError(err)) {
-          modelIndex++;
-          if (modelIndex >= MODELS.length) throw err; // All models exhausted
-          currentModel = MODELS[modelIndex];
-          console.warn(`[Model] Switching to: ${currentModel} (${err.message})`);
-          i--; // Retry this iteration with the new model
-          continue;
-        }
-        throw err;
-      }
-
-      const choice = completion.choices[0];
-      const message = choice.message;
-
-      // Collect any text the model produces
-      if (message.content) {
-        finalResponseText += message.content + '\n';
-      }
-
-      // If no tool calls, the model is done
-      if (!message.tool_calls || message.tool_calls.length === 0) {
-        messages.push({ role: 'assistant', content: message.content || '' });
-        break;
-      }
-
-      // Push the assistant's tool-call message into history
-      messages.push(message);
-
-      // Execute each tool call and push results back
-      for (const toolCall of message.tool_calls) {
-        console.log(`Executing tool: ${toolCall.function.name}`);
-        let resultContent = 'Tool executed.';
-
-        try {
-          const args = JSON.parse(toolCall.function.arguments);
-          const result = await mcpClient.callTool({
-            name: toolCall.function.name,
-            arguments: args
-          });
-
-          if (result.content && result.content.length > 0) {
-            resultContent = result.content.map(c => c.text).join('\n');
-          }
-          console.log(`Tool result preview: ${resultContent.substring(0, 80)}...`);
-        } catch (err) {
-          console.error(`Tool ${toolCall.function.name} error:`, err.message);
-          resultContent = `Error executing tool: ${err.message}`;
-        }
-
-        messages.push({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          name: toolCall.function.name,
-          content: resultContent
-        });
-      }
-    }
+    // Run the shared agentic loop
+    const finalResponseText = await runAgentLoop(messages, openAiTools);
 
     const responseText = finalResponseText.trim() || 'Task completed.';
     console.log(`[${new Date().toISOString()}] Agent done. Response: ${responseText.substring(0, 100)}...`);
@@ -426,10 +812,125 @@ app.post('/webhook', async (req, res) => {
     res.json({ text: responseText });
 
   } catch (err) {
-    console.error('Webhook error:', err);
+    console.error('Cliq webhook error:', err);
     res.status(500).json({
       text: 'Something went wrong on my end. Please try again.'
     });
+  }
+});
+
+// ============================================================
+// MAIL WEBHOOK HANDLER — POST /mail-webhook  (Zoho Mail via Zoho Flow)
+// Payload from Zoho Flow contains the inbound email details.
+// The message may be prefixed with [This is a client mail] by Zoho Flow.
+// ============================================================
+app.post('/mail-webhook', async (req, res) => {
+  try {
+    console.log('\n[MAIL WEBHOOK] RAW BODY:', JSON.stringify(req.body, null, 2));
+    // Parse body if it arrived as a string
+    if (typeof req.body === 'string') {
+      try { req.body = JSON.parse(req.body); } catch { req.body = { text: req.body }; }
+    }
+
+    // Normalise array payloads (Zoho Flow sometimes sends ["text"])
+    // If the body is an array, join its elements into a single text string
+    if (Array.isArray(req.body)) {
+      req.body = { text: req.body.join(' ') };
+    }
+
+    // ── Extract email fields sent by Zoho Flow ──────────────────────
+    const rawText = req.body?.text || '';
+    const fromAddr = req.body?.fromAddress || req.body?.from || req.body?.sender || '';
+    const toAddr = req.body?.toAddress || req.body?.to || '';
+    const subject = req.body?.subject || '(No Subject)';
+    const emailBody = req.body?.content || req.body?.summary || req.body?.body || rawText;
+    const messageId = req.body?.messageId || req.body?.message_id || '';
+
+    // Stop email loops (e.g. system replying to itself)
+    const normalizedFrom = fromAddr.toLowerCase();
+    if (normalizedFrom.includes('enquiriesbirmingham2@zohomail.com') ||
+      normalizedFrom.includes('enquiriesbirmingham2@zohomail.com')) {
+      console.log(`[MAIL WEBHOOK] Ignored email from internal address (${fromAddr}) to prevent auto-reply loops.`);
+      return res.status(200).json({ status: 'ignored', reason: 'Internal auto-reply loop' });
+    }
+
+    const emailContext = `
+SOURCE: Inbound Zoho Mail (POST /mail-webhook)
+MARKER: [This is a client mail]
+
+FROM: ${fromAddr}
+TO: ${toAddr}
+SUBJECT: ${subject}
+MESSAGE ID: ${messageId}
+
+EMAIL BODY:
+${emailBody}
+`.trim();
+
+    console.log(`[MAIL WEBHOOK] From: ${fromAddr} | Subject: ${subject}`);
+
+    // Lazy-init MCP client
+    if (!mcpClient && process.env.ZOHO_MCP_URL) {
+      console.log('Initializing MCP Client for mail-webhook...');
+      mcpClient = await initMcpClient();
+    }
+
+    // Fetch MCP tools and FILTER to only what the mail workflow needs
+    // Sending 135 tools overloads the token limit and breaks tool-calling on free models
+    let openAiTools = [];
+    if (mcpClient) {
+      try {
+        const { tools: mcpTools } = await mcpClient.listTools();
+
+        const MAIL_REQUIRED_TOOLS = [
+          'ZohoCRM_searchRecords',
+          'ZohoCRM_createLeadsRecords',
+          'ZohoBookings_fetchAppointment',
+          'ZohoBookings_bookAppointment',
+          'ZohoBooks_list_items',
+          'ZohoMail_sendEmail',
+          'ZohoCRM_updateLeadsRecord',
+          'ZohoCliq_Post_message_in_a_channel'
+        ];
+
+        openAiTools = (mcpTools || [])
+          .filter(tool => MAIL_REQUIRED_TOOLS.includes(tool.name))
+          .map(tool => ({
+            type: 'function',
+            function: {
+              name: tool.name,
+              description: tool.description,
+              parameters: simplifySchema(tool)
+            }
+          }));
+        console.log(`[MAIL WEBHOOK] Loaded ${openAiTools.length} MCP tools (filtered from ${mcpTools?.length}).`);
+      } catch (err) {
+        console.error('[MAIL WEBHOOK] Failed to list MCP tools:', err.message);
+      }
+    }
+
+    const currentDate = new Date().toISOString().split('T')[0];
+
+    // Build messages for the agent
+    const messages = [
+      { role: 'system', content: `Current Date: ${currentDate}\n\n${EMAIL_SYSTEM_PROMPT}` },
+      {
+        role: 'user',
+        content: `Process the following inbound client email and carry out the full workflow:\n\n${emailContext}`
+      }
+    ];
+
+    // Run the shared agentic loop
+    const finalResponseText = await runAgentLoop(messages, openAiTools);
+
+    console.log(`[MAIL WEBHOOK] Agent done. ${finalResponseText.substring(0, 100)}...`);
+
+    // Respond 200 immediately so Zoho Flow doesn't retry
+    res.status(200).json({ status: 'processed', summary: finalResponseText.substring(0, 300) });
+
+  } catch (err) {
+    console.error('[MAIL WEBHOOK] Error:', err);
+    res.status(500).json({ status: 'error', message: err.message });
   }
 });
 
@@ -439,7 +940,11 @@ app.post('/webhook', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
-    service: 'Birmingham Glass Solutions — Cliq Bot',
+    service: 'Birmingham Glass Solutions — Webhook Bridge',
+    routes: {
+      cliq: 'POST /webhook',
+      mail: 'POST /mail-webhook'
+    },
     timestamp: new Date().toISOString()
   });
 });
@@ -450,11 +955,12 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
   console.log(`
   ================================================
-   Birmingham Glass Solutions — Cliq Bot Webhook
+   Birmingham Glass Solutions — Webhook Bridge
   ================================================
-   Server running on port ${PORT}
-   Webhook endpoint: POST /webhook
-   Health check   : GET  /
+   Server running on port        : ${PORT}
+   Cliq bot endpoint             : POST /webhook
+   Zoho Mail inbound endpoint    : POST /mail-webhook
+   Health check                  : GET  /
   ================================================
   `);
 });
